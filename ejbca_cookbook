@@ -158,6 +158,4 @@ sudo ant deploy-keystore # at this point there should be no errors, if they occu
 :reload
 :shutdown(restart=true)
 
-sudo ant -q clean deployear
-sudo ant -q runinstall
-
+#under construction
