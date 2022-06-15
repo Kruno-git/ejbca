@@ -1,0 +1,163 @@
+yum install vim epel-release wget tar unzip java-1.8.0-openjdk-devel ant psmisc mariadb bc patch top selinux-policy-devel mariadb-server -y
+
+firewall-cmd --add-port=80/tcp --permanent
+firewall-cmd --add-port=443/tcp --permanent
+firewall-cmd --add-port=8443/tcp --permanent
+firewall-cmd --add-port=9990/tcp --permanent
+firewall-cmd --add-port=8080/tcp --permanent
+firewall-cmd --add-port=8442/tcp --permanent
+firewall-cmd --add-port=4447/tcp --permanent
+firewall-cmd --reload 
+
+#optional settings selinux 
+
+semanage port -l | grep http
+semanage port -a -t http_port_t -p tcp 8442
+semanage port -a -t http_port_t -p tcp 8080
+semanage port -a -t http_port_t -p tcp 9990
+setsebool mysql_connect_http on
+
+useradd -r -U -m -d /opt/wildfly wildfly
+passwd wildfly
+usermod -aG wheel wildfly
+systemctl enable mariadb && systemctl start mariadb
+mysql_secure_installation # set root passwd
+
+mysql -u root -p
+ CREATE DATABASE ejbca CHARACTER SET utf8 COLLATE utf8_general_ci;
+ CREATE USER 'ejbca'@'web.server.kruno' IDENTIFIED BY 'admin12345.';
+ GRANT ALL PRIVILEGES ON ejbca.* TO 'ejbca'@'web.server.kruno' IDENTIFIED BY 'admin12345.';
+ FLUSH PRIVILEGES;
+
+su - wildfly
+
+#wildfly service configuration 
+
+sudo wget https://download.jboss.org/wildfly/10.1.0.Final/wildfly-10.1.0.Final.tar.gz
+sudo tar -zxf wildfly-10.1.0.Final.tar.gz
+sudo chown -RH wildfly: opt/
+sudo mkdir /etc/wildfly
+
+sudo cp wildfly/docs/contrib/scripts/systemd/wildfly.conf /etc/wildfly
+sudo cp wildfly/docs/contrib/scripts/systemd/launch.sh /opt/wildfly/bin #change WILDFLY_HOME variable
+sudo cp wildfly/docs/contrib/scripts/systemd/wildfly.service /etc/systemd/system/ #change User=ejbca & ExecStart folder path
+chmod +x /opt/wildfly/bin/*.sh
+echo 'JAVA_OPTS="-Xms2048m -Xmx2048m -Djava.net.preferIPv4Stack=true"' >> /opt/wildfly/bin/standalone.conf 
+sudo systemctl daemon-reload && sudo systemctl enable wildfly && sudo systemctl start wildfly
+reboot
+
+wget https://downloads.mariadb.com/Connectors/java/connector-java-2.2.6/mariadb-java-client-2.2.6-javadoc.jar
+sudo -u wildfly cp /tmp/mariadb-java-client-2.2.6-javadoc.jar /opt/wildfly/standalone/deployments/mariadb-java-client.jar
+cd /opt/wildfly/bin
+./jboss-cli.sh -c 
+
+#adding database source information. Change DB username and password. 
+
+data-source add --name=ejbcads --driver-name="mariadb-java-client.jar" --connection-url="jdbc:mysql://127.0.0.1:3306/ejbca" --jndi-name="java:/EjbcaDS" --use-ccm=true --driver-class="org.mariadb.jdbc.Driver" --user-name="ejbca" --password="admin12345." --validate-on-match=true --background-validation=false --prepared-statements-cache-size=50 --share-prepared-statements=true --min-pool-size=5 --max-pool-size=150 --pool-prefill=true --transaction-isolation=TRANSACTION_READ_COMMITTED --check-valid-connection-sql="select 1;"
+:reload
+
+
+wget https://sourceforge.net/projects/ejbca/files/latest/download
+unzip download
+sudo cp database.properties.sample database.properties
+sudo cp cesecore.properties.sample cesecore.properties
+sudo cp ejbca.properties.sample ejbca.properties
+sudo cp web.properties.sample web.properties
+sudo cp install.properties.sample install.properties
+
+#databse.properties append on the end of the file 
+
+echo 'database.name=mysql' >> /opt/ejbca_ce_7_9_0_1/conf/database.properties
+echo 'database.url=jdbc:mysql://127.0.0.1:3306/ejbca?characterEncoding=UTF-8' >> /opt/ejbca_ce_7_9_0_1/conf/database.properties
+echo 'database.driver=org.mariadb.jdbc.Driver' >> /opt/ejbca_ce_7_9_0_1/conf/database.properties
+echo 'database.username=ejbca' >> /opt/ejbca_ce_7_9_0_1/conf/database.properties
+echo 'database.password=admin12345.' >> /opt/ejbca_ce_7_9_0_1/conf/database.properties
+
+#vim cesecore.properties
+
+certificate.validityoffset=-18m
+
+#vim ejbca.properties 
+echo 'appserver.home=/opt/wildfly-10.1.0.Final' >> /opt/ejbca_ce_7_9_0_1/conf/ejbca.properties
+
+#vim install.properties
+ca.name=PHub-Mgmt-CA
+ca-dn=CN=CN=PHub-Mgmt-CA,O=INC CA,C=HR
+ca.keyspec=4096
+ca.keytype=RSA
+ca.validity=10950
+
+#vim web.properties
+
+httpsserver.dn=CN${httpsserver.hostname},O=INC CA,C=HR
+sudo chown -R wildfly: ejbca_folder
+
+# running wildfly commandline interface
+
+sh /opt/wildfly/bin/jboss-cli.sh -c   
+
+#wildfly remoting
+
+/subsystem=remoting/http-connector=http-remoting-connector:remove
+/subsystem=remoting/http-connector=http-remoting-connector:add(connector-ref="remoting",security-realm="ApplicationRealm")
+/socket-binding-group=standard-sockets/socket-binding=remoting:add(port="4447")
+/subsystem=undertow/server=default-server/http-listener=remoting:add(socket-binding=remoting)
+:reload
+
+#logging
+
+/subsystem=logging/logger=org.ejbca:add
+/subsystem=logging/logger=org.ejbca:write-attribute(name=level, value=DEBUG)
+/subsystem=logging/logger=org.cesecore:add
+/subsystem=logging/logger=org.cesecore:write-attribute(name=level, value=DEBUG)
+:reload
+exit
+sudo ant -q clean deployear
+sudo ant -q runinstall
+sudo ant deploy-keystore # at this point there should be no errors, if they occur, don't continue configuration
+
+#removing existing TLS and http config
+
+/subsystem=undertow/server=default-server/http-listener=default:remove
+/subsystem=undertow/server=default-server/https-listener=https:remove
+/socket-binding-group=standard-sockets/socket-binding=http:remove
+/socket-binding-group=standard-sockets/socket-binding=https:remove
+:reload
+
+#Configuring TLS (passwords must be strong)
+
+/interface=http:add(inet-address="0.0.0.0")
+/interface=httpspub:add(inet-address="0.0.0.0")
+/interface=httpspriv:add(inet-address="0.0.0.0")
+/socket-binding-group=standard-sockets/socket-binding=http:add(port="8080",interface="http")
+/subsystem=undertow/server=default-server/http-listener=http:add(socket-binding=http)
+/subsystem=undertow/server=default-server/http-listener=http:write-attribute(name=redirect-socket, value="httpspriv")
+:reload
+
+/core-service=management/security-realm=SSLRealm:add()
+/core-service=management/security-realm=SSLRealm/server-identity=ssl:add(keystore-path="${jboss.server.config.dir}/keystore/keystore.jks", keystore-password="joc@amst3rdam", alias="localhost")
+/core-service=management/security-realm=SSLRealm/authentication=truststore:add(keystore-path="${jboss.server.config.dir}/keystore/truststore.jks", keystore-password="joc@amst3rdam")
+/socket-binding-group=standard-sockets/socket-binding=httpspriv:add(port="8443",interface="httpspriv")
+/socket-binding-group=standard-sockets/socket-binding=httpspub:add(port="8442", interface="httpspub")
+
+#reload completely
+
+/subsystem=undertow/server=default-server/https-listener=httpspriv:add(socket-binding=httpspriv, security-realm="SSLRealm", verify-client=REQUIRED)
+/subsystem=undertow/server=default-server/https-listener=httpspriv:write-attribute(name=max-parameters, value="4096")
+/subsystem=undertow/server=default-server/https-listener=httpspub:add(socket-binding=httpspub, security-realm="SSLRealm")
+/subsystem=undertow/server=default-server/https-listener=httpspub:write-attribute(name=max-parameters, value="4096")
+:reload
+
+
+/system-property=org.apache.tomcat.util.buf.UDecoder.ALLOW_ENCODED_SLASH:add(value=true)
+/system-property=org.apache.catalina.connector.CoyoteAdapter.ALLOW_BACKSLASH:add(value=true)
+/system-property=org.apache.catalina.connector.URI_ENCODING:add(value="UTF-8")
+/system-property=org.apache.catalina.connector.USE_BODY_ENCODING_FOR_QUERY_STRING:add(value=true)
+/subsystem=webservices:write-attribute(name=wsdl-host, value=jbossws.undefined.host)
+/subsystem=webservices:write-attribute(name=modify-wsdl-address, value=true)
+:reload
+:shutdown(restart=true)
+
+sudo ant -q clean deployear
+sudo ant -q runinstall
+
